@@ -1,51 +1,59 @@
 """
-WakeSleepSTT - lightweight wake-word controlled real-time STT module (Python + Vosk)
+WakeSleepSTT - lightweight wake/sleep word controlled real-time STT module (Python + Vosk)
 
-Public API (class WakeSleepSTT):
-  - constructor(config)
-  - on(event, callback)   # events: 'wake','sleep','transcript','error'
-  - start()               # starts mic listening (wake-word mode)
-  - stop()                # stop listening & transcription
-  - close()               # cleanup
+Wake word: "hello"
+Sleep word: "goodbye"
 
-Transcripts emitted as dict: { 'text': str, 'isFinal': bool, 'timestamp': float }
+Behavior:
+ - Hotword recognizer (grammar-limited) runs while idle.
+ - On final "hello" -> wait for next voiced chunk, then start full recognizer.
+ - Full recognizer runs only while awake; stops on "goodbye".
+ - Only transcribes between hello → goodbye, saving transcript on sleep.
 """
 
 import json
 import time
 import threading
 import queue
+import os
+from datetime import datetime
+import numpy as np
 from vosk import Model, KaldiRecognizer
 from .audio_capture import MicrophoneStream
 
 class WakeSleepSTT:
     def __init__(self, config=None):
         cfg = config or {}
-        self.wake_words = [w.lower() for w in cfg.get('wakeWords', ['hi'])]
-        self.sleep_words = [w.lower() for w in cfg.get('sleepWords', ['bye'])]
+        self.wake_words = [w.lower() for w in cfg.get('wakeWords', ['hello'])]
+        self.sleep_words = [w.lower() for w in cfg.get('sleepWords', ['goodbye'])]
         self.model_path = cfg.get('modelPath', './models/vosk')
         self.sample_rate = cfg.get('sampleRate', 16000)
         self.audio_source = cfg.get('audioSource', 'mic')
+        self.vad_threshold = cfg.get('vadThreshold', 0.01)  
+        self.debounce_secs = cfg.get('debounceSecs', 0.6)
+
         self._callbacks = {'wake': [], 'sleep': [], 'transcript': [], 'error': []}
         self._model = None
-        self._recognizer = None
+        self._hot_recognizer = None
+        self._full_recognizer = None
         self._mic = None
         self._running = False
         self._awake = False
-        self._audio_q = queue.Queue(maxsize=200)
+        self._audio_q = queue.Queue(maxsize=500)
         self._proc_thread = None
         self._lock = threading.Lock()
+        self._session_buffer = []
+        self._waiting_for_voiced_chunk = False
+        self._last_wake_time = 0.0
 
-    # ---- public API ----
+    # ---- Public API ----
     def on(self, event, cb):
         if event not in self._callbacks:
-            raise ValueError('Unsupported event: ' + str(event))
+            raise ValueError(f'Unsupported event: {event}')
         self._callbacks[event].append(cb)
 
     def start(self):
-        """
-        Start microphone capture and processing thread. Module enters wake-listening mode.
-        """
+        """Start microphone capture and processing thread."""
         with self._lock:
             if self._running:
                 return
@@ -54,19 +62,17 @@ class WakeSleepSTT:
             except Exception as e:
                 self._emit('error', e)
                 raise
-            self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
-            self._recognizer.SetWords(False)  
 
+            self._hot_recognizer = self._create_hot_recognizer(self._model, self.sample_rate)
             self._mic = MicrophoneStream(sample_rate=self.sample_rate, blocksize=4000, audio_q=self._audio_q)
             self._mic.start()
+
             self._running = True
             self._proc_thread = threading.Thread(target=self._processing_loop, daemon=True)
             self._proc_thread.start()
 
     def stop(self):
-        """
-        Stop mic and processing. Module will stop completely.
-        """
+        """Stop mic and processing."""
         with self._lock:
             if not self._running:
                 return
@@ -78,6 +84,12 @@ class WakeSleepSTT:
                 self._proc_thread.join(timeout=1.0)
                 self._proc_thread = None
 
+            self._hot_recognizer = None
+            self._full_recognizer = None
+            self._awake = False
+            self._waiting_for_voiced_chunk = False
+            self._session_buffer = []
+
     def close(self):
         self.stop()
         self._emit('closed', None)
@@ -87,25 +99,49 @@ class WakeSleepSTT:
             try:
                 cb(payload)
             except Exception as e:
-                try:
-                    for ec in self._callbacks.get('error', []):
+                for ec in self._callbacks.get('error', []):
+                    try:
                         ec(e)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+
+    def _create_hot_recognizer(self, model, samplerate):
+        grammar = json.dumps(self.wake_words + self.sleep_words)
+        try:
+            return KaldiRecognizer(model, samplerate, grammar)
+        except Exception:
+            return KaldiRecognizer(model, samplerate)
+
+    def _save_transcript(self, text, folder="transcripts"):
+        text = (text or '').strip()
+        if not text:
+            return
+        os.makedirs(folder, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        filename = os.path.join(folder, f'transcript_{timestamp}.txt')
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(text + "\n")
+        print(f"[💾] Transcript saved to: {filename}")
+
+    @staticmethod
+    def _rms_from_int16_bytes(bts):
+        try:
+            arr = np.frombuffer(bts, dtype=np.int16).astype(np.float32)
+            if arr.size == 0:
+                return 0.0
+            arr = arr / 32767.0
+            return float(np.sqrt(np.mean(np.square(arr))))
+        except Exception:
+            return 0.0
+
+    def _is_wake_in(self, text):
+        return any(w in text.lower() for w in self.wake_words)
+
+    def _is_sleep_in(self, text):
+        return any(s in text.lower() for s in self.sleep_words)
 
     def _processing_loop(self):
-        """
-        Consume raw PCM chunks from audio queue, feed recognizer, and handle wake/sleep logic.
-        We run a single Vosk recognizer: it produces partial results (partialResult) and final results (result).
-        We interpret partial + final texts for keywords.
-        """
         session_active = False
-        last_wake_time = 0
-        debounce_secs = 0.6
-
-        recognizer = KaldiRecognizer(self._model, self.sample_rate)
-        recognizer.SetWords(False)
-
         while self._running:
             try:
                 chunk = self._audio_q.get(timeout=0.5)
@@ -115,56 +151,81 @@ class WakeSleepSTT:
             if chunk is None:
                 continue
 
-            try:
-                accepted = recognizer.AcceptWaveform(chunk)
-            except Exception as e:
-                self._emit('error', e)
-                continue
+            rms = self._rms_from_int16_bytes(chunk)
+            if self._waiting_for_voiced_chunk:
+                if rms >= self.vad_threshold:
+                    try:
+                        self._full_recognizer = KaldiRecognizer(self._model, self.sample_rate)
+                        self._full_recognizer.SetWords(False)
+                        self._awake = True
+                        session_active = True
+                        self._session_buffer = []
+                        self._waiting_for_voiced_chunk = False
+                        self._hot_recognizer = None
+                        self._emit('wake', {'word': 'hello', 'timestamp': time.time()})
+                    except Exception as e:
+                        self._emit('error', e)
+                        self._waiting_for_voiced_chunk = False
+                        continue
+                else:
+                    continue
+            if session_active and self._full_recognizer is not None:
+                try:
+                    accepted = self._full_recognizer.AcceptWaveform(chunk)
+                except Exception as e:
+                    self._emit('error', e)
+                    accepted = False
 
-            if accepted:
-                try:
-                    res = json.loads(recognizer.Result())
-                except Exception as e:
-                    self._emit('error', e)
-                    continue
-                text = (res.get('text') or '').strip()
-                if text:
-                    low = text.lower()
-                    if not session_active:
-                        if any(w in low for w in self.wake_words) and (time.time() - last_wake_time) > debounce_secs:
-                            last_wake_time = time.time()
-                            session_active = True
-                            self._awake = True
-                            self._emit('wake', {'word': text, 'timestamp': time.time()})
-                    else:
+                if accepted:
+                    res = json.loads(self._full_recognizer.Result())
+                    text = (res.get('text') or '').strip()
+                    if text:
+                        self._session_buffer.append(text)
                         self._emit('transcript', {'text': text, 'isFinal': True, 'timestamp': time.time()})
-                        if any(s in low for s in self.sleep_words):
-                            session_active = False
+                        if self._is_sleep_in(text):
                             self._awake = False
+                            session_active = False
+                            if self._session_buffer:
+                                self._save_transcript(" ".join(self._session_buffer))
+                            self._session_buffer = []
+                            self._full_recognizer = None
+                            self._hot_recognizer = self._create_hot_recognizer(self._model, self.sample_rate)
                             self._emit('sleep', {'word': text, 'timestamp': time.time()})
-            else:
+                else:
+                    pres = json.loads(self._full_recognizer.PartialResult())
+                    partial = (pres.get('partial') or '').strip()
+                    if partial:
+                        self._emit('transcript', {'text': partial, 'isFinal': False, 'timestamp': time.time()})
+                        if self._is_sleep_in(partial):
+                            self._awake = False
+                            session_active = False
+                            if self._session_buffer:
+                                self._save_transcript(" ".join(self._session_buffer))
+                            self._session_buffer = []
+                            self._full_recognizer = None
+                            self._hot_recognizer = self._create_hot_recognizer(self._model, self.sample_rate)
+                            self._emit('sleep', {'word': partial, 'timestamp': time.time()})
+                time.sleep(0.001)
+                continue
+            if self._hot_recognizer is not None:
                 try:
-                    pres = json.loads(recognizer.PartialResult())
+                    hot_ok = self._hot_recognizer.AcceptWaveform(chunk)
                 except Exception as e:
                     self._emit('error', e)
-                    continue
-                partial = pres.get('partial', '').strip()
-                if partial:
-                    low = partial.lower()
-                    if not session_active:
-                        if any(w in low for w in self.wake_words) and (time.time() - last_wake_time) > debounce_secs:
-                            last_wake_time = time.time()
-                            session_active = True
-                            self._awake = True
-                            self._emit('wake', {'word': partial, 'timestamp': time.time()})
-                    else:
-                        self._emit('transcript', {'text': partial, 'isFinal': False, 'timestamp': time.time()})
-                        if any(s in low for s in self.sleep_words):
-                            session_active = False
-                            self._awake = False
-                            self._emit('sleep', {'word': partial, 'timestamp': time.time()})
+                    hot_ok = False
+
+                if hot_ok:
+                    res = json.loads(self._hot_recognizer.Result())
+                    text = (res.get('text') or '').strip().lower()
+                    if text:
+                        if (not session_active) and self._is_wake_in(text) and (time.time() - self._last_wake_time) > self.debounce_secs:
+                            self._last_wake_time = time.time()
+                            self._waiting_for_voiced_chunk = True
+
             time.sleep(0.001)
 
+        if self._awake and self._session_buffer:
+            self._save_transcript(" ".join(self._session_buffer))
         try:
             self._audio_q.queue.clear()
         except Exception:
